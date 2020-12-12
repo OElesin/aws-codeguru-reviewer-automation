@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  A serverless application that checks for new reviews by Amazon CodeGuru Reviewer
+  and notifies team about the recommendations. This serverless application works
+  based on a repository that has been previously associated with Amazon CodeGuru.
+
+Parameters:
+  AssociatedRepositoryName:
+    Type: String
+    Description: 'Amazon CodeGuru Reviewer associated repository name.'
+  TeamEmail:
+    Type: String
+    Description: 'Team email address to send CodeGuru Reviewer Notifications.'
+
+Globals:
+  Function:
+    Timeout: 180
+
+Resources:
+  GetAllCodeGuruReviewsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 'codeguru-reviewer-get-all-reviews'
+      CodeUri: get_all_reviews/
+      Runtime: python3.8
+      Handler: app.lambda_handler
+      Description: 'Lists of reviews related to a CodeGuru associated repository'
+      Environment:
+        Variables:
+          ASSOCIATED_REPOSITORY: !Ref AssociatedRepositoryName
+          CODEGURU_REVIEWER_STATE_MACHINE_ARN: !Ref CodeGuruReviewerStateMachineWorkflow
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - codeguru-reviewer:DescribeRepositoryAssociation
+              Resource: !Sub 'arn:aws:codeguru-reviewer:${AWS::Region}:${AWS::AccountId}:association:*'
+            - Effect: Allow
+              Action:
+                - codeguru-reviewer:ListCodeReviews
+              Resource: '*'
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt CodeGuruReviewerStateMachineWorkflow.Name
+      Events:
+        HourlySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: 'rate(1 hour)'
+            Name: CGRviewerChecker
+            Enabled: True
+
+  CheckCodeGuruReviewerStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 'check-code-review-status'
+      CodeUri: check_code_reviewer_status/
+      Runtime: python3.8
+      Handler: app.lambda_handler
+      Description: 'Checks the status of a Pull Rquest Code Review'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - codeguru-reviewer:DescribeCodeReview
+              Resource: '*'
+
+  CodeGuruReviewerTeamNotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 'codeguru-reviewer-team-notifier'
+      CodeUri: codeguru_review_notification/
+      Runtime: python3.8
+      Handler: app.lambda_handler
+      Description: 'Sends team email with CodeGuru Reviewer recommendations'
+      Environment:
+        Variables:
+          CODEGURU_SNS_TOPIC: !Ref CodeGuruReviewerSNSTopic
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - codeguru-reviewer:ListRecommendations
+              Resource: '*'
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt CodeGuruReviewerSNSTopic.TopicName
+
+  CodeGuruReviewerStateMachineWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: ManageCodeGuruReviewerNotifications
+      Definition:
+        StartAt: CheckCodeGuruReviewerStatus
+        States:
+          CheckCodeGuruReviewerStatus:
+            Type: Task
+            Resource: !GetAtt CheckCodeGuruReviewerStatusFunction.Arn
+            Next: PullRequestReviewWaiter
+          PullRequestReviewWaiter:
+            Type: Wait
+            Seconds: 60
+            Next: CodeGuruPullRequestReviewChoice
+          CodeGuruPullRequestReviewChoice:
+            Type: Choice
+            Choices:
+              - Variable: $.State
+                StringEquals: 'Completed'
+                Next: PublishCodeGuruRecommendations
+              - Variable: $.State
+                StringEquals: 'Pending'
+                Next: CheckCodeGuruReviewerStatus
+              - Variable: $.State
+                StringEquals: 'Failed'
+                Next: InformTeamPRFailedOrDeleted
+              - Variable: $.State
+                StringEquals: 'Deleting'
+                Next: InformTeamPRFailedOrDeleted
+          PublishCodeGuruRecommendations:
+            Type: Task
+            Resource: !GetAtt CodeGuruReviewerTeamNotifierFunction.Arn
+            End: True
+          InformTeamPRFailedOrDeleted:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              Message: |
+                There is a failed/deleted CodeGuru Reviewer Pull Request review.
+                Kindly investigate this.
+
+                Best regards,
+
+                Amazon CodeGuru Reviewer.
+            End: True
+      Policies:
+        - CloudWatchLogsFullAccess
+        - CloudWatchEventsFullAccess
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckCodeGuruReviewerStatusFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CodeGuruReviewerTeamNotifierFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref CodeGuruReviewerSNSTopic
+
+  CodeGuruReviewerSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref TeamEmail
