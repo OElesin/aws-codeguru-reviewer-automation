@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-ARTIFACTS_BUCKET="galudy-visual-search-artifacts"
+ARTIFACTS_BUCKET="your-artifacts-s3-bucket"
 S3_WORKFLOW_PREFIX="aws-codeguru-reviewer-automation"
 WORKFLOW_STACK_NAME="aws-codeguru-reviewer-automation-wf"
 
